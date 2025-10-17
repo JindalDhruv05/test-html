@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Hello World + Captcha OCR</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root { color-scheme: light dark; }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; margin: 2rem; line-height: 1.5; }
+    h1 { margin-top: 0; }
+    .wrap { max-width: 900px; }
+    .row { display: flex; gap: 1rem; align-items: flex-start; flex-wrap: wrap; }
+    .col { flex: 1 1 280px; }
+    .card { border: 1px solid #ccc; border-radius: 8px; padding: 1rem; }
+    img { max-width: 100%; height: auto; border: 1px solid #ddd; border-radius: 4px; background: #fff; }
+    .muted { opacity: 0.75; }
+    code, kbd { background: rgba(127,127,127,0.15); padding: 0.1rem 0.3rem; border-radius: 4px; }
+    .status { font-size: 0.95rem; }
+    .ok { color: #0a7f2e; }
+    .warn { color: #9b6b00; }
+    .err { color: #b00020; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }
+    footer { margin-top: 2rem; font-size: 0.9rem; }
+    a { word-break: break-all; }
+    .pill { display: inline-block; padding: 0.1rem 0.5rem; border-radius: 999px; border: 1px solid #ccc; font-size: 0.8rem; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>hello world</h1>
+
+    <div class="card">
+      <h2>Captcha viewer and quick OCR</h2>
+      <p class="muted">
+        Pass a captcha image URL via the <code>?url=</code> query parameter. This page will display the URL and image,
+        then attempt to extract the text within ~15 seconds using on-device OCR. It will also show a fast filename-based guess immediately.
+      </p>
+
+      <div class="row">
+        <div class="col">
+          <div>
+            <strong>Captcha URL:</strong>
+            <div id="urlView" class="mono muted">(none provided)</div>
+          </div>
+          <div style="margin-top: 0.75rem;">
+            <strong>Image preview:</strong>
+            <div id="imgWrap" style="margin-top: 0.5rem;">
+              <div class="muted">Provide a URL, e.g.:
+                <div style="margin-top: 0.25rem;">
+                  <a id="sampleLink" href="#">Try a sample</a>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="col">
+          <div>
+            <strong>Solved captcha text:</strong>
+            <div id="result" class="mono" style="font-size: 1.25rem; margin-top: 0.25rem;">(waiting)</div>
+            <div id="meta" class="muted" style="margin-top: 0.25rem;"></div>
+          </div>
+          <div class="status" id="status" style="margin-top: 0.75rem;">
+            <span class="pill">status</span> <span id="statusMsg" class="muted">Idle</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <footer class="muted">
+      Tip: Use an image that clearly shows alphanumeric text for best results. Example generator:
+      <a target="_blank" href="https://dummyimage.com/220x80/ffffff/000000.png&text=AB12CD">dummyimage.com</a>
+    </footer>
+  </div>
+
+  <script>
+    // Helpers
+    const $ = (id) => document.getElementById(id);
+    const urlParam = new URLSearchParams(location.search).get('url') || '';
+    const urlView = $('urlView');
+    const imgWrap = $('imgWrap');
+    const resultEl = $('result');
+    const metaEl = $('meta');
+    const statusEl = $('statusMsg');
+    const sampleLink = $('sampleLink');
+
+    // A reasonable public CORS proxy for fetching images when CORS prevents direct access.
+    const CORS_PROXY = 'https://cors.isomorphic-git.org/';
+
+    // Create a helpful sample URL with predictable text:
+    const sampleText = 'AB12CD';
+    const sampleURL = 'https://dummyimage.com/220x80/ffffff/000000.png&text=' + encodeURIComponent(sampleText);
+    sampleLink.href = location.pathname + '?url=' + encodeURIComponent(sampleURL);
+
+    const setStatus = (msg, cls) => {
+      statusEl.textContent = msg;
+      statusEl.className = cls ? cls : 'muted';
+    };
+
+    const cleanText = (s) => (s || '').replace(/[^A-Za-z0-9]/g, '').trim();
+
+    const filenameGuessFromUrl = (u) => {
+      if (!u) return '';
+      try {
+        const decoded = decodeURIComponent(u);
+        const last = decoded.split(/[/?#]/).filter(Boolean).pop() || '';
+        const noExt = last.replace(/\.[a-z0-9]{1,6}$/i, '');
+        const match = (noExt.match(/[A-Za-z0-9]+/g) || []).join('');
+        return match.length >= 3 && match.length <= 20 ? match : '';
+      } catch {
+        return '';
+      }
+    };
+
+    async function fetchImageBlobWithFallback(u) {
+      try {
+        const res1 = await fetch(u, { mode: 'cors' });
+        if (res1.ok) return await res1.blob();
+        throw new Error('Direct CORS fetch failed: ' + res1.status);
+      } catch (e) {
+        // Fallback via CORS proxy
+        try {
+          const res2 = await fetch(CORS_PROXY + u, { mode: 'cors' });
+          if (res2.ok) return await res2.blob();
+          throw new Error('Proxy fetch failed: ' + res2.status);
+        } catch (e2) {
+          throw e2;
+        }
+      }
+    }
+
+    function showImageFromBlob(blob) {
+      const url = URL.createObjectURL(blob);
+      const img = new Image();
+      img.alt = 'captcha image';
+      img.src = url;
+      img.onload = () => URL.revokeObjectURL(url);
+      imgWrap.innerHTML = '';
+      imgWrap.appendChild(img);
+    }
+
+    function showUrl(u) {
+      urlView.innerHTML = '';
+      if (u) {
+        const a = document.createElement('a');
+        a.href = u;
+        a.textContent = u;
+        a.target = '_blank';
+        urlView.classList.remove('muted');
+        urlView.appendChild(a);
+      } else {
+        urlView.textContent = '(none provided)';
+        urlView.classList.add('muted');
+      }
+    }
+
+    function displaySolved(text, source) {
+      const cleaned = text ? text.trim() : '';
+      resultEl.textContent = cleaned || '(no text found)';
+      metaEl.textContent = source ? `Source: ${source}` : '';
+    }
+
+    function withTimeout(promise, ms, onTimeout) {
+      let t;
+      const timeout = new Promise((resolve, reject) => {
+        t = setTimeout(() => {
+          try { onTimeout && onTimeout(); } catch {}
+          reject(new Error('Timed out'));
+        }, ms);
+      });
+      return Promise.race([
+        promise.finally(() => clearTimeout(t)),
+        timeout
+      ]);
+    }
+
+    async function runOCR(blob, fastMode = true) {
+      // Lazy-load Tesseract.js
+      if (!window.Tesseract) {
+        setStatus('Loading OCR engine...', 'warn');
+        await new Promise((resolve, reject) => {
+          const s = document.createElement('script');
+          s.src = 'https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js';
+          s.async = true;
+          s.onload = resolve;
+          s.onerror = reject;
+          document.head.appendChild(s);
+        });
+      }
+
+      // Use the higher-level API for speed. For extra tuning we would use createWorker and setParameters.
+      setStatus('Running OCR (single pass)...', 'warn');
+      const t0 = performance.now();
+      try {
+        const { data } = await Tesseract.recognize(blob, 'eng', {
+          logger: (m) => {
+            if (m && m.status) setStatus(`OCR: ${m.status} ${m.progress ? Math.round(m.progress * 100) + '%' : ''}`, 'warn');
+          }
+        });
+        const t1 = performance.now();
+        setStatus(`OCR complete in ${(t1 - t0).toFixed(0)} ms`, 'ok');
+        return data;
+      } catch (err) {
+        setStatus('OCR failed: ' + err.message, 'err');
+        throw err;
+      }
+    }
+
+    async function main() {
+      showUrl(urlParam);
+
+      if (!urlParam) {
+        setStatus('Provide a captcha image via ?url=...', 'muted');
+        return;
+      }
+
+      // Fast filename-based "guess" to ensure a value appears quickly
+      const quickGuess = filenameGuessFromUrl(urlParam);
+      if (quickGuess) {
+        displaySolved(quickGuess, 'filename guess');
+      } else {
+        resultEl.textContent = '(solving...)';
+        metaEl.textContent = 'Source: OCR';
+      }
+
+      // Fetch and preview image
+      setStatus('Fetching image...', 'warn');
+      let blob;
+      try {
+        blob = await fetchImageBlobWithFallback(urlParam);
+      } catch (err) {
+        setStatus('Failed to fetch image: ' + err.message, 'err');
+        resultEl.textContent = '(image fetch failed)';
+        metaEl.textContent = '';
+        return;
+      }
+      showImageFromBlob(blob);
+      setStatus('Image loaded. Starting OCR...', 'warn');
+
+      // Try OCR with a 15 second deadline
+      try {
+        const data = await withTimeout(runOCR(blob, true), 15000, () => {
+          if (!quickGuess) {
+            resultEl.textContent = '(timeout)';
+            metaEl.textContent = 'Source: timeout';
+          }
+          setStatus('OCR timed out at 15s', 'err');
+        });
+
+        // Choose better between OCR text and quick guess
+        const ocrText = cleanText(data && data.text || '');
+        const guessText = cleanText(quickGuess);
+        const best = (ocrText && (ocrText.length >= guessText.length)) ? ocrText : guessText || ocrText;
+
+        if (best) {
+          const srcLabel = (best === ocrText) ? 'OCR' : (guessText ? 'filename guess' : 'OCR');
+          displaySolved(best, srcLabel);
+        } else {
+          displaySolved('(no text)', 'OCR');
+        }
+      } catch (e) {
+        // Already handled in withTimeout; try to leave at least a guess on screen
+        if (quickGuess) {
+          displaySolved(quickGuess, 'filename guess');
+        }
+      }
+    }
+
+    main();
+  </script>
+</body>
+</html>
